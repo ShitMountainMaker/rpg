@@ -145,6 +145,12 @@ class Trainer:
         self.log(f'Best epoch: {best_epoch}, Best val score: {best_val_score}')
         return best_epoch, best_val_score
 
+    def _set_generate_mode(self, split: str):
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'generate_w_decoding_graph'):
+            use_graph = self.config.get(f'{split}_use_graph_decoding', split == 'test')
+            model.generate_w_decoding_graph = use_graph
+
     def evaluate(self, dataloader, split='test'):
         """
         Evaluate the model on the given dataloader.
@@ -157,6 +163,7 @@ class Trainer:
             OrderedDict: A dictionary containing the evaluation results.
         """
         self.model.eval()
+        self._set_generate_mode(split)
 
         all_results = defaultdict(list)
         val_progress_bar = tqdm(

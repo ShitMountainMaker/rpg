@@ -46,6 +46,66 @@ class ResBlock(nn.Module):
         return x + self.act(self.linear(x))
 
 
+class ConsensusCorrection(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        consensus_hidden_dim: int,
+        beta: float,
+        alpha_init: float,
+        mask_self: bool,
+        detach_confidence: bool,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.query = nn.Linear(hidden_dim, consensus_hidden_dim)
+        self.key = nn.Linear(hidden_dim, consensus_hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.register_buffer('confidence_bias_scale', torch.tensor(beta, dtype=torch.float32))
+        self.mask_self = mask_self
+        self.detach_confidence = detach_confidence
+        self.eps = eps
+        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+    def _compute_confidence(self, probs: torch.Tensor) -> torch.Tensor:
+        log_vocab = torch.log(torch.tensor(probs.shape[-1], device=probs.device, dtype=probs.dtype))
+        entropy = -(probs * torch.log(probs.clamp_min(self.eps))).sum(dim=-1)
+        confidence = 1.0 - entropy / log_vocab
+        return confidence.detach() if self.detach_confidence else confidence
+
+    def forward(self, logits: torch.Tensor, token_embs: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=-1)
+        summaries = torch.einsum('bmv,mvd->bmd', probs, token_embs)
+        confidence = self._compute_confidence(probs)
+
+        queries = self.query(summaries)
+        keys = self.key(summaries)
+        values = self.value(summaries)
+
+        attn_scores = torch.matmul(queries, keys.transpose(-1, -2))
+        attn_scores = attn_scores / (queries.shape[-1] ** 0.5)
+        attn_scores = attn_scores + self.confidence_bias_scale * torch.log(confidence.clamp_min(self.eps)).unsqueeze(-2)
+
+        if self.mask_self:
+            diag_mask = torch.eye(attn_scores.shape[-1], device=attn_scores.device, dtype=torch.bool)
+            attn_scores = attn_scores.masked_fill(diag_mask.unsqueeze(0), float('-inf'))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        messages = torch.matmul(attn_weights, values)
+
+        gate_inputs = torch.cat([summaries, messages, confidence.unsqueeze(-1)], dim=-1)
+        gate = torch.sigmoid(self.gate(gate_inputs))
+        delta_summary = gate * messages
+        delta_logits = torch.einsum('bmd,mvd->bmv', delta_summary, token_embs)
+        return logits + self.alpha * delta_logits
+
+
 class RPG(AbstractModel):
     def __init__(
         self,
@@ -83,6 +143,17 @@ class RPG(AbstractModel):
 
         self.temperature = self.config['temperature']
         self.loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.ignored_label)
+        self.use_consensus_correction = self.config.get('use_consensus_correction', False)
+        self.consensus_correction = None
+        if self.use_consensus_correction:
+            self.consensus_correction = ConsensusCorrection(
+                hidden_dim=self.config['n_embd'],
+                consensus_hidden_dim=self.config.get('consensus_hidden_dim', 64),
+                beta=self.config.get('consensus_beta', 0.2),
+                alpha_init=self.config.get('consensus_alpha_init', 0.0),
+                mask_self=self.config.get('consensus_mask_self', True),
+                detach_confidence=self.config.get('consensus_detach_confidence', True),
+            )
 
         # Graph-constrained decoding
         self.generate_w_decoding_graph = False
@@ -113,6 +184,24 @@ class RPG(AbstractModel):
                 f'#Non-embedding parameters: {total_params - emb_params}\n' \
                 f'#Total trainable parameters: {total_params}\n'
 
+    def _get_codebook_token_embs(self) -> torch.Tensor:
+        token_embs = self.gpt2.wte.weight[1:-1]
+        token_embs = F.normalize(token_embs, dim=-1)
+        return token_embs.view(self.n_pred_head, self.config['codebook_size'], -1)
+
+    def _compute_codebook_logits(self, states: torch.Tensor) -> torch.Tensor:
+        token_embs = self._get_codebook_token_embs()
+        logits = torch.einsum('bmd,mvd->bmv', states, token_embs) / self.temperature
+        if self.consensus_correction is not None:
+            logits = self.consensus_correction(logits, token_embs)
+        return logits
+
+    def _get_last_step_states(self, final_states: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+        return final_states.gather(
+            dim=1,
+            index=(seq_lens - 1).view(-1, 1, 1, 1).expand(-1, 1, self.n_pred_head, self.config['n_embd'])
+        )[:, 0]
+
     def forward(self, batch: dict, return_loss=True) -> torch.Tensor:
         input_tokens = self.item_id2tokens[batch['input_ids']]
         input_embs = self.gpt2.wte(input_tokens).mean(dim=-2)
@@ -128,14 +217,10 @@ class RPG(AbstractModel):
             label_mask = batch['labels'].view(-1) != -100
             selected_states = final_states.view(-1, self.n_pred_head, self.config['n_embd'])[label_mask]
             selected_states = F.normalize(selected_states, dim=-1)
-            selected_states = torch.chunk(selected_states, self.n_pred_head, dim=1)
-            token_emb = self.gpt2.wte.weight[1:-1]
-            token_emb = F.normalize(token_emb, dim=-1)
-            token_embs = torch.chunk(token_emb, self.n_pred_head, dim=0)
-            token_logits = [torch.matmul(selected_states[i].squeeze(dim=1), token_embs[i].T) / self.temperature for i in range(self.n_pred_head)]
+            token_logits = self._compute_codebook_logits(selected_states)
             token_labels = self.item_id2tokens[batch['labels'].view(-1)[label_mask]]
             losses = [
-                self.loss_fct(token_logits[i], token_labels[:, i] - i * self.config['codebook_size'] - 1)
+                self.loss_fct(token_logits[:, i, :], token_labels[:, i] - i * self.config['codebook_size'] - 1)
                 for i in range(self.n_pred_head)
             ]
             outputs.loss = torch.mean(torch.stack(losses))
@@ -277,18 +362,11 @@ class RPG(AbstractModel):
 
     def generate(self, batch, n_return_sequences=1):
         outputs = self.forward(batch, return_loss=False)
-        states = outputs.final_states.gather(
-            dim=1,
-            index=(batch['seq_lens'] - 1).view(-1, 1, 1, 1).expand(-1, 1, self.n_pred_head, self.config['n_embd'])
-        )
+        states = self._get_last_step_states(outputs.final_states, batch['seq_lens'])
         states = F.normalize(states, dim=-1)
 
-        token_emb = self.gpt2.wte.weight[1:-1]
-        token_emb = F.normalize(token_emb, dim=-1)
-        token_embs = torch.chunk(token_emb, self.n_pred_head, dim=0)
-        logits = [torch.matmul(states[:,0,i,:], token_embs[i].T) / self.temperature for i in range(self.n_pred_head)]
-        logits = [F.log_softmax(logit, dim=-1) for logit in logits]
-        token_logits = torch.cat(logits, dim=-1)    # (batch_size, n_tokens)
+        codebook_logits = self._compute_codebook_logits(states)
+        token_logits = F.log_softmax(codebook_logits, dim=-1).reshape(codebook_logits.shape[0], -1)
 
         if self.generate_w_decoding_graph:
             if not self.init_flag:
