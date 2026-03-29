@@ -7,6 +7,7 @@
 import os
 import math
 import json
+from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
@@ -105,9 +106,18 @@ class RPGTokenizer(AbstractTokenizer):
         for i in range(1, dataset.n_items):
             meta_sentences.append(dataset.item2meta[dataset.id_mapping['id2item'][i]])
 
-        if 'sentence-transformers' in self.config['sent_emb_model']:
+        sent_emb_model_name = self.config['sent_emb_model']
+        sent_emb_model_path = Path(sent_emb_model_name)
+        is_local_sentence_transformer = (
+            sent_emb_model_path.exists() and (
+                (sent_emb_model_path / 'modules.json').exists() or
+                (sent_emb_model_path / 'config_sentence_transformers.json').exists()
+            )
+        )
+
+        if 'sentence-transformers' in sent_emb_model_name or is_local_sentence_transformer:
             sent_emb_model = SentenceTransformer(
-                self.config['sent_emb_model']
+                sent_emb_model_name
             ).to(self.config['device'])
 
             sent_embs = sent_emb_model.encode(
@@ -117,7 +127,7 @@ class RPGTokenizer(AbstractTokenizer):
                 show_progress_bar=True,
                 device=self.config['device']
             )
-        elif 'text-embedding-3' in self.config['sent_emb_model']:
+        elif 'text-embedding-3' in sent_emb_model_name:
             from openai import OpenAI
             client = OpenAI(api_key=self.config['openai_api_key'])
 
@@ -151,6 +161,12 @@ class RPGTokenizer(AbstractTokenizer):
                 for response in responses.data:
                     sent_embs.append(response.embedding)
             sent_embs = np.array(sent_embs, dtype=np.float32)
+        else:
+            raise ValueError(
+                f'Unsupported sent_emb_model: {sent_emb_model_name}. '
+                'Expected a sentence-transformers model name, a local SentenceTransformer directory, '
+                'or an OpenAI text-embedding-3 model.'
+            )
 
         sent_embs.tofile(output_path)
         return sent_embs

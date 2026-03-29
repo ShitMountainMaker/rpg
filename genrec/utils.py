@@ -61,7 +61,19 @@ def get_local_time():
 
 
 def get_command_line_args_str():
-    return '_'.join(sys.argv).replace('/', '|')
+    cli_hash = hashlib.md5(' '.join(sys.argv).encode(encoding="utf-8")).hexdigest()[:8]
+    summary_args = [os.path.basename(sys.argv[0])]
+    for arg in sys.argv[1:]:
+        if not arg.startswith('--') or '=' not in arg:
+            continue
+        key, value = arg[2:].split('=', 1)
+        if key not in {'category', 'run_id', 'sent_emb_model'}:
+            continue
+        if '/' in value or value.startswith('.'):
+            value = os.path.basename(value.rstrip('/'))
+        summary_args.append(f'{key}={value}')
+    summary_args.append(cli_hash)
+    return '_'.join(summary_args).replace('/', '|')
 
 
 def get_file_name(config: dict, suffix: str = ''):

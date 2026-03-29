@@ -1,4 +1,6 @@
-torch --index-url https://download.pytorch.org/whl/cu129
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
 accelerate==1.10.1
 datasets==4.0.0
 faiss-cpu==1.12.0
