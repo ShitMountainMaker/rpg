@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #SBATCH -p emergency_gpu
 #SBATCH --gres=gpu:1
-#SBATCH --chdir=/hpc2hdd/home/cwu319/RC/RPG_KDD2025
-#SBATCH -o /hpc2hdd/home/cwu319/RC/RPG_KDD2025/history/%x-%j.out
-#SBATCH -e /hpc2hdd/home/cwu319/RC/RPG_KDD2025/history/%x-%j.err
+#SBATCH --chdir=/hpc2hdd/home/cwu319/RC/method
+#SBATCH -o /hpc2hdd/home/cwu319/RC/method/history/%x-%j.out
+#SBATCH -e /hpc2hdd/home/cwu319/RC/method/history/%x-%j.err
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=rpg-baseline
 
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/hpc2hdd/home/cwu319/RC/RPG_KDD2025}"
+REPO_ROOT="${REPO_ROOT:-/hpc2hdd/home/cwu319/RC/method}"
 CATEGORY="${1:-Sports_and_Outdoors}"
 
 case "$CATEGORY" in
