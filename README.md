@@ -31,6 +31,17 @@ Note that:
 
 ## Reproduction
 
+### Sentence-T5 Table 4 Reference
+
+The following settings are the current sentence-t5-base reference values aligned with Table 4.
+
+| Dataset | Best ID Length | Table 4 Value |
+| --- | ---: | ---: |
+| Sports_and_Outdoors | 16 | 0.0238 |
+| Beauty | 32 | 0.0429 |
+| Toys_and_Games | 16 | 0.0460 |
+| CDs_and_Vinyl | 64 | 0.0380 |
+
 ### Sports and Outdoors
 
 ```
