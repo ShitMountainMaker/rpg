@@ -44,6 +44,17 @@ consensus_alpha_init: 0.0
 consensus_mask_self: True
 consensus_detach_confidence: True
 
+#   HFRS
+use_hfrs: False
+hfrs_stage: A
+hfrs_res_dim: 16
+hfrs_beta_scale: 0.1
+hfrs_rerank_topk: 16
+hfrs_pool_topm: 128
+hfrs_min_pool_size: 4
+hfrs_hard_negative_file: ~
+hfrs_use_base_only: True
+
 #   evaluation
 val_use_graph_decoding: False
 test_use_graph_decoding: True

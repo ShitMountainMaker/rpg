@@ -54,6 +54,7 @@ esac
 
 RUN_ID="${RUN_ID:-baseline_${CATEGORY}_st5}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+SENT_EMB_MODEL="${SENT_EMB_MODEL:-/hpc2hdd/home/cwu319/RC/method/st5base}"
 
 cd "$REPO_ROOT"
 
@@ -71,6 +72,7 @@ export USE_TF="${USE_TF:-0}"
 echo "repo_root=$REPO_ROOT"
 echo "category=$CATEGORY"
 echo "run_id=$RUN_ID"
+echo "sent_emb_model=$SENT_EMB_MODEL"
 echo "host=$(hostname)"
 echo "started_at=$(date '+%F %T')"
 nvidia-smi || true
@@ -78,7 +80,7 @@ nvidia-smi || true
 python main.py \
   --category="$CATEGORY" \
   --run_id="$RUN_ID" \
-  --sent_emb_model=sentence-transformers/sentence-t5-base \
+  --sent_emb_model="$SENT_EMB_MODEL" \
   --sent_emb_dim=768 \
   --sent_emb_pca=128 \
   --lr="$LR" \

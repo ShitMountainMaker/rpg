@@ -4,6 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import math
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -163,6 +167,33 @@ class RPG(AbstractModel):
         self.n_edges = config['n_edges']
         self.propagation_steps = config['propagation_steps']
 
+        # Hard-Family Holistic Item Scorer (HFRS)
+        self.use_hfrs = self.config.get('use_hfrs', False)
+        self.hfrs_stage = self.config.get('hfrs_stage', 'A')
+        self.hfrs_res_dim = self.config.get('hfrs_res_dim', 16)
+        self.hfrs_beta_scale = self.config.get('hfrs_beta_scale', 0.1)
+        self.hfrs_rerank_topk = self.config.get('hfrs_rerank_topk', 16)
+        self.hfrs_pool_topm = self.config.get('hfrs_pool_topm', 128)
+        self.hfrs_min_pool_size = self.config.get('hfrs_min_pool_size', 4)
+        self.hfrs_use_base_only = self.config.get('hfrs_use_base_only', True)
+        self.hfrs_hard_negative_file = self.config.get('hfrs_hard_negative_file')
+
+        self.register_buffer(
+            'hfrs_hard_negative_table',
+            torch.zeros((0, 0), dtype=torch.long),
+            persistent=False
+        )
+        self.register_buffer(
+            'hfrs_hard_negative_lengths',
+            torch.zeros((0,), dtype=torch.long),
+            persistent=False
+        )
+
+        if self.use_hfrs:
+            self._init_hfrs_modules()
+            self._load_hfrs_hard_negative_pool()
+            self._configure_hfrs_stage()
+
     def _map_item_tokens(self) -> torch.Tensor:
         """
         Maps item tokens to their corresponding item IDs.
@@ -189,6 +220,74 @@ class RPG(AbstractModel):
         token_embs = F.normalize(token_embs, dim=-1)
         return token_embs.view(self.n_pred_head, self.config['codebook_size'], -1)
 
+    def _init_hfrs_modules(self):
+        query_input_dim = self.config['n_embd']
+        self.hfrs_user_query = nn.Sequential(
+            nn.Linear(query_input_dim, self.config['n_embd']),
+            nn.SiLU(),
+            nn.Linear(self.config['n_embd'], self.hfrs_res_dim),
+        )
+        self.hfrs_token_key = nn.Linear(self.config['n_embd'], self.hfrs_res_dim)
+        self.hfrs_token_value = nn.Linear(self.config['n_embd'], self.hfrs_res_dim)
+        self.hfrs_score_proj = nn.Linear(1, self.hfrs_res_dim)
+        self.hfrs_attn_out = nn.Linear(self.hfrs_res_dim, 1)
+        self.hfrs_position_emb = nn.Embedding(self.n_pred_head, self.hfrs_res_dim)
+        self.hfrs_residual_head = nn.Sequential(
+            nn.Linear(self.hfrs_res_dim * 2 + 4, self.config['n_embd']),
+            nn.SiLU(),
+            nn.Linear(self.config['n_embd'], 1),
+        )
+
+        beta_target = 0.01 / max(self.hfrs_beta_scale, 1e-8)
+        beta_target = min(max(beta_target, -0.999), 0.999)
+        self.hfrs_beta_raw = nn.Parameter(torch.tensor(math.atanh(beta_target), dtype=torch.float32))
+
+    def _load_hfrs_hard_negative_pool(self):
+        if not self.hfrs_hard_negative_file:
+            return
+
+        hard_negative_path = self.hfrs_hard_negative_file
+        if not os.path.exists(hard_negative_path):
+            return
+
+        with open(hard_negative_path, 'r') as f:
+            item_to_hard_negatives = json.load(f)
+
+        table = torch.zeros((self.dataset.n_items, self.hfrs_pool_topm), dtype=torch.long)
+        lengths = torch.zeros((self.dataset.n_items,), dtype=torch.long)
+        for item_id_str, negative_ids in item_to_hard_negatives.items():
+            item_id = int(item_id_str)
+            filtered_negatives = []
+            seen = set()
+            for negative_id in negative_ids:
+                negative_id = int(negative_id)
+                if negative_id <= 0 or negative_id >= self.dataset.n_items or negative_id == item_id:
+                    continue
+                if negative_id in seen:
+                    continue
+                seen.add(negative_id)
+                filtered_negatives.append(negative_id)
+                if len(filtered_negatives) >= self.hfrs_pool_topm:
+                    break
+            if not filtered_negatives:
+                continue
+            lengths[item_id] = len(filtered_negatives)
+            table[item_id, :len(filtered_negatives)] = torch.tensor(filtered_negatives, dtype=torch.long)
+
+        self.hfrs_hard_negative_table = table.to(self.config['device'])
+        self.hfrs_hard_negative_lengths = lengths.to(self.config['device'])
+
+    def _configure_hfrs_stage(self):
+        if not self.use_hfrs or self.hfrs_stage != 'A' or not self.hfrs_use_base_only:
+            return
+
+        for module in (self.gpt2, self.pred_heads):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+        if self.consensus_correction is not None:
+            for parameter in self.consensus_correction.parameters():
+                parameter.requires_grad = False
+
     def _compute_codebook_logits(self, states: torch.Tensor) -> torch.Tensor:
         token_embs = self._get_codebook_token_embs()
         logits = torch.einsum('bmd,mvd->bmv', states, token_embs) / self.temperature
@@ -202,6 +301,149 @@ class RPG(AbstractModel):
             index=(seq_lens - 1).view(-1, 1, 1, 1).expand(-1, 1, self.n_pred_head, self.config['n_embd'])
         )[:, 0]
 
+    def _get_target_item_ids(self, batch: dict) -> torch.Tensor:
+        labels = batch['labels']
+        if labels.dim() == 1:
+            return labels
+        if labels.shape[1] == 1:
+            return labels[:, 0]
+        return labels.gather(1, (batch['seq_lens'] - 1).view(-1, 1)).squeeze(1)
+
+    @property
+    def hfrs_beta_eff(self) -> torch.Tensor:
+        return self.hfrs_beta_scale * torch.tanh(self.hfrs_beta_raw)
+
+    def _compute_token_log_probs(self, states: torch.Tensor) -> torch.Tensor:
+        codebook_logits = self._compute_codebook_logits(states)
+        return F.log_softmax(codebook_logits, dim=-1).reshape(codebook_logits.shape[0], -1)
+
+    def _gather_candidate_tokens(self, item_ids: torch.Tensor) -> torch.Tensor:
+        safe_item_ids = item_ids.clamp(min=1)
+        return self.item_id2tokens[safe_item_ids]
+
+    def _gather_item_token_scores(self, token_logits: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        if item_ids.dim() == 1:
+            item_ids = item_ids.unsqueeze(0).expand(token_logits.shape[0], -1)
+        candidate_tokens = self._gather_candidate_tokens(item_ids)
+        gathered_scores = torch.gather(
+            token_logits.unsqueeze(-2).expand(-1, candidate_tokens.shape[1], -1),
+            dim=-1,
+            index=(candidate_tokens - 1)
+        )
+        return gathered_scores
+
+    def score_item_ids_base(self, token_logits: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        return self._gather_item_token_scores(token_logits, item_ids).mean(dim=-1)
+
+    def _get_hfrs_query(self, states: torch.Tensor) -> torch.Tensor:
+        pooled_states = states.mean(dim=1)
+        return self.hfrs_user_query(pooled_states)
+
+    def _compute_hfrs_residual(self, states: torch.Tensor, token_logits: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        if item_ids.dim() == 1:
+            item_ids = item_ids.unsqueeze(0).expand(token_logits.shape[0], -1)
+
+        candidate_tokens = self._gather_candidate_tokens(item_ids)
+        token_scores = self._gather_item_token_scores(token_logits, item_ids)
+        token_embs = self.gpt2.wte(candidate_tokens)
+        token_embs = F.normalize(token_embs, dim=-1)
+
+        query = self._get_hfrs_query(states)
+        token_keys = self.hfrs_token_key(token_embs)
+        score_features = self.hfrs_score_proj(token_scores.unsqueeze(-1))
+        position_features = self.hfrs_position_emb.weight.view(1, 1, self.n_pred_head, -1)
+
+        attn_hidden = torch.tanh(
+            query.unsqueeze(1).unsqueeze(1) +
+            token_keys +
+            score_features +
+            position_features
+        )
+        attn_weights = torch.softmax(self.hfrs_attn_out(attn_hidden).squeeze(-1), dim=-1)
+
+        token_values = self.hfrs_token_value(token_embs)
+        holistic_item = (attn_weights.unsqueeze(-1) * token_values).sum(dim=-2)
+        token_stats = torch.stack([
+            token_scores.mean(dim=-1),
+            token_scores.max(dim=-1).values,
+            token_scores.std(dim=-1, correction=0),
+        ], dim=-1)
+
+        residual_inputs = torch.cat([
+            query.unsqueeze(1).expand(-1, item_ids.shape[1], -1),
+            holistic_item,
+            token_stats
+        ], dim=-1)
+        residual = self.hfrs_residual_head(residual_inputs).squeeze(-1)
+        return residual
+
+    def score_item_ids_total(self, states: torch.Tensor, token_logits: torch.Tensor, item_ids: torch.Tensor):
+        base_scores = self.score_item_ids_base(token_logits, item_ids)
+        if not self.use_hfrs:
+            return base_scores, torch.zeros_like(base_scores)
+        residual_scores = self._compute_hfrs_residual(states, token_logits, item_ids)
+        total_scores = base_scores + self.hfrs_beta_eff * residual_scores
+        return total_scores, residual_scores
+
+    def get_base_topk_candidates(self, token_logits: torch.Tensor, k: int):
+        all_item_ids = torch.arange(1, self.dataset.n_items, device=token_logits.device, dtype=torch.long)
+        all_item_ids = all_item_ids.unsqueeze(0).expand(token_logits.shape[0], -1)
+        base_scores = self.score_item_ids_base(token_logits, all_item_ids)
+        topk_scores, topk_indices = base_scores.topk(k, dim=-1)
+        topk_item_ids = all_item_ids.gather(1, topk_indices)
+        return topk_item_ids, topk_scores
+
+    def _compute_hfrs_loss(self, states: torch.Tensor, token_logits: torch.Tensor, positive_item_ids: torch.Tensor):
+        if self.hfrs_hard_negative_table.numel() == 0:
+            raise FileNotFoundError(
+                'HFRS training requires a valid hfrs_hard_negative_file with mined per-item hard negatives.'
+            )
+
+        hard_negative_lengths = self.hfrs_hard_negative_lengths[positive_item_ids]
+        valid_mask = hard_negative_lengths >= self.hfrs_min_pool_size
+        if not valid_mask.any():
+            zero = token_logits.sum() * 0.0
+            return zero, {
+                'family_listwise_loss': 0.0,
+                'beta_eff': self.hfrs_beta_eff.detach().item(),
+                'residual_pos_mean': 0.0,
+                'residual_neg_mean': 0.0,
+                'family_positive_rank': 0.0,
+                'family_training_examples': 0.0,
+            }
+
+        states = states[valid_mask]
+        token_logits = token_logits[valid_mask]
+        positive_item_ids = positive_item_ids[valid_mask]
+
+        negative_ids = self.hfrs_hard_negative_table[positive_item_ids, :self.hfrs_rerank_topk]
+        negative_mask = negative_ids > 0
+        candidate_mask = torch.cat([
+            torch.ones((positive_item_ids.shape[0], 1), dtype=torch.bool, device=positive_item_ids.device),
+            negative_mask
+        ], dim=1)
+
+        candidate_item_ids = torch.cat([positive_item_ids.unsqueeze(1), negative_ids], dim=1)
+        total_scores, residual_scores = self.score_item_ids_total(states, token_logits, candidate_item_ids)
+        masked_scores = total_scores.masked_fill(~candidate_mask, -1e9)
+
+        listwise_loss = -F.log_softmax(masked_scores, dim=-1)[:, 0].mean()
+        residual_pos_mean = residual_scores[:, 0].mean()
+        if negative_mask.any():
+            residual_neg_mean = residual_scores[:, 1:][negative_mask].mean()
+        else:
+            residual_neg_mean = residual_scores[:, 0].new_zeros(())
+        positive_rank = 1 + ((masked_scores[:, 1:] > masked_scores[:, :1]) & candidate_mask[:, 1:]).sum(dim=-1).float()
+
+        return listwise_loss, {
+            'family_listwise_loss': listwise_loss.detach().item(),
+            'beta_eff': self.hfrs_beta_eff.detach().item(),
+            'residual_pos_mean': residual_pos_mean.detach().item(),
+            'residual_neg_mean': residual_neg_mean.detach().item(),
+            'family_positive_rank': positive_rank.mean().detach().item(),
+            'family_training_examples': float(positive_item_ids.shape[0]),
+        }
+
     def forward(self, batch: dict, return_loss=True) -> torch.Tensor:
         input_tokens = self.item_id2tokens[batch['input_ids']]
         input_embs = self.gpt2.wte(input_tokens).mean(dim=-2)
@@ -214,16 +456,27 @@ class RPG(AbstractModel):
         outputs.final_states = final_states
         if return_loss:
             assert 'labels' in batch, 'The batch must contain the labels.'
-            label_mask = batch['labels'].view(-1) != -100
-            selected_states = final_states.view(-1, self.n_pred_head, self.config['n_embd'])[label_mask]
-            selected_states = F.normalize(selected_states, dim=-1)
-            token_logits = self._compute_codebook_logits(selected_states)
-            token_labels = self.item_id2tokens[batch['labels'].view(-1)[label_mask]]
-            losses = [
-                self.loss_fct(token_logits[:, i, :], token_labels[:, i] - i * self.config['codebook_size'] - 1)
-                for i in range(self.n_pred_head)
-            ]
-            outputs.loss = torch.mean(torch.stack(losses))
+            if self.use_hfrs:
+                selected_states = self._get_last_step_states(final_states, batch['seq_lens'])
+                selected_states = F.normalize(selected_states, dim=-1)
+                token_logits = self._compute_token_log_probs(selected_states)
+                positive_item_ids = self._get_target_item_ids(batch)
+                outputs.loss, outputs.log_dict = self._compute_hfrs_loss(
+                    states=selected_states,
+                    token_logits=token_logits,
+                    positive_item_ids=positive_item_ids
+                )
+            else:
+                label_mask = batch['labels'].view(-1) != -100
+                selected_states = final_states.view(-1, self.n_pred_head, self.config['n_embd'])[label_mask]
+                selected_states = F.normalize(selected_states, dim=-1)
+                token_logits = self._compute_codebook_logits(selected_states)
+                token_labels = self.item_id2tokens[batch['labels'].view(-1)[label_mask]]
+                losses = [
+                    self.loss_fct(token_logits[:, i, :], token_labels[:, i] - i * self.config['codebook_size'] - 1)
+                    for i in range(self.n_pred_head)
+                ]
+                outputs.loss = torch.mean(torch.stack(losses))
         return outputs
 
     def build_ii_sim_mat(self):
@@ -365,10 +618,11 @@ class RPG(AbstractModel):
         states = self._get_last_step_states(outputs.final_states, batch['seq_lens'])
         states = F.normalize(states, dim=-1)
 
-        codebook_logits = self._compute_codebook_logits(states)
-        token_logits = F.log_softmax(codebook_logits, dim=-1).reshape(codebook_logits.shape[0], -1)
+        token_logits = self._compute_token_log_probs(states)
 
         if self.generate_w_decoding_graph:
+            if self.use_hfrs:
+                raise ValueError('HFRS only supports graph-off / exact evaluation. Set test_use_graph_decoding=False.')
             if not self.init_flag:
                 self.init_graph()
                 self.init_flag = True
@@ -378,10 +632,18 @@ class RPG(AbstractModel):
             )
             return outputs
         else:
-            item_logits = torch.gather(
-                input=token_logits.unsqueeze(-2).expand(-1, self.dataset.n_items, -1),              # (batch_size, n_items, n_tokens)
-                dim=-1,
-                index=(self.item_id2tokens[1:,:] - 1).unsqueeze(0).expand(token_logits.shape[0], -1, -1)  # (batch_size, n_items, code_dim)
-            ).mean(dim=-1)
-            preds = item_logits.topk(n_return_sequences, dim=-1).indices + 1
+            all_item_ids = torch.arange(1, self.dataset.n_items, device=token_logits.device, dtype=torch.long)
+            all_item_ids = all_item_ids.unsqueeze(0).expand(token_logits.shape[0], -1)
+            base_scores = self.score_item_ids_base(token_logits, all_item_ids)
+
+            if not self.use_hfrs:
+                preds = base_scores.topk(n_return_sequences, dim=-1).indices + 1
+                return preds.unsqueeze(-1)
+
+            rerank_topk = min(self.hfrs_rerank_topk, base_scores.shape[1])
+            candidate_scores, candidate_indices = base_scores.topk(rerank_topk, dim=-1)
+            candidate_item_ids = all_item_ids.gather(1, candidate_indices)
+            total_scores, _ = self.score_item_ids_total(states, token_logits, candidate_item_ids)
+            topk_scores, topk_indices = total_scores.topk(min(n_return_sequences, rerank_topk), dim=-1)
+            preds = candidate_item_ids.gather(1, topk_indices)
             return preds.unsqueeze(-1)

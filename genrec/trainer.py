@@ -66,8 +66,9 @@ class Trainer:
             train_dataloader: The dataloader for training data.
             val_dataloader: The dataloader for validation data.
         """
+        trainable_parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
         optimizer = AdamW(
-            self.model.parameters(),
+            trainable_parameters,
             lr=self.config['lr'],
             weight_decay=self.config['weight_decay']
         )
@@ -101,6 +102,8 @@ class Trainer:
             # Training
             self.model.train()
             total_loss = 0.0
+            log_sums = defaultdict(float)
+            log_counts = defaultdict(int)
             train_progress_bar = tqdm(
                 train_dataloader,
                 total=len(train_dataloader),
@@ -116,9 +119,22 @@ class Trainer:
                 optimizer.step()
                 scheduler.step()
                 total_loss = total_loss + loss.item()
+                if hasattr(outputs, 'log_dict'):
+                    for key, value in outputs.log_dict.items():
+                        scalar_value = value.item() if torch.is_tensor(value) else float(value)
+                        log_sums[key] += scalar_value
+                        log_counts[key] += 1
 
-            self.accelerator.log({"Loss/train_loss": total_loss / len(train_dataloader)}, step=epoch + 1)
+            train_logs = {"Loss/train_loss": total_loss / len(train_dataloader)}
+            for key, total in log_sums.items():
+                if log_counts[key] > 0:
+                    train_logs[f'HFRS/{key}'] = total / log_counts[key]
+
+            self.accelerator.log(train_logs, step=epoch + 1)
             self.log(f'[Epoch {epoch + 1}] Train Loss: {total_loss / len(train_dataloader)}')
+            if log_sums:
+                hfrs_log = {key: log_sums[key] / log_counts[key] for key in log_sums if log_counts[key] > 0}
+                self.log(f'[Epoch {epoch + 1}] HFRS Train Metrics: {hfrs_log}')
 
             # Evaluation
             if (epoch + 1) % self.config['eval_interval'] == 0:

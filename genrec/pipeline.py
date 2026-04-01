@@ -71,8 +71,17 @@ class Pipeline:
         with self.accelerator.main_process_first():
             self.model = get_model(model_name)(self.config, self.raw_dataset, self.tokenizer)
             if checkpoint_path is not None:
-                self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.config['device']))
-                self.log(f'Loaded model checkpoint from {checkpoint_path}')
+                state_dict = torch.load(checkpoint_path, map_location=self.config['device'])
+                if self.config.get('use_hfrs', False):
+                    load_result = self.model.load_state_dict(state_dict, strict=False)
+                    self.log(f'Loaded model checkpoint from {checkpoint_path}')
+                    if load_result.missing_keys:
+                        self.log(f'HFRS missing keys from checkpoint: {load_result.missing_keys}', level='warning')
+                    if load_result.unexpected_keys:
+                        self.log(f'HFRS unexpected keys from checkpoint: {load_result.unexpected_keys}', level='warning')
+                else:
+                    self.model.load_state_dict(state_dict)
+                    self.log(f'Loaded model checkpoint from {checkpoint_path}')
         self.log(self.model)
         self.log(self.model.n_parameters)
 
