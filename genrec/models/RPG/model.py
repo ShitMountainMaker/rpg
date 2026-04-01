@@ -233,7 +233,7 @@ class RPG(AbstractModel):
         self.hfrs_attn_out = nn.Linear(self.hfrs_res_dim, 1)
         self.hfrs_position_emb = nn.Embedding(self.n_pred_head, self.hfrs_res_dim)
         self.hfrs_residual_head = nn.Sequential(
-            nn.Linear(self.hfrs_res_dim * 2 + 4, self.config['n_embd']),
+            nn.Linear(self.hfrs_res_dim * 2 + 3, self.config['n_embd']),
             nn.SiLU(),
             nn.Linear(self.config['n_embd'], 1),
         )
